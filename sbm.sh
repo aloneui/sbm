@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # sbm — sing-box 节点/中转管理脚本
-# 由 Muse 为 Jessica 从零编写。不含任何第三方脚本代码。
+# 由 Muse 从零编写。不含任何第三方脚本代码。
 # 设计原则:
 #   1. 核心只从 sing-box 官方 GitHub Release 下载, 有校验文件时强制 SHA-256 校验
 #   2. 本脚本永不自更新, 不回传任何数据; 除包管理器和官方 Release 外不访问其他地址
@@ -1102,7 +1102,7 @@ local st="未运行" xv="未安装"
 [ "$(svc_state)" = "active" ] && st="${C_G}运行中${C_R}"
 cat >&2 <<EOF
 
-sbm v$VER — sing-box 管理 (Muse 为 Jessica 编写, 无自更新/无回传)
+sbm v$VER — sing-box 管理 (Muse 编写, 无自更新/无回传)
 系统版本: $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}")
 sing-box: $(core_version || echo 未安装) 服务: $st
 Xray 服务: 未包含在本版
