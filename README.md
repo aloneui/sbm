@@ -1,14 +1,37 @@
 # sbm — sing-box 节点/中转管理脚本
 
 由 Muse 从零编写（不含任何第三方脚本代码）。
-版本 v0.4.3，单文件 bash，依赖：jq、curl、openssl（脚本会自动用 apt 安装）。
+版本 v0.5.0，单文件 bash，依赖：jq、curl、openssl（脚本会自动用 apt 安装）。
 
 ## 设计原则
 1. 核心只从 sing-box 官方 GitHub Release 下载；官方未提供校验文件时明确提示，并打印安装包 SHA-256 备查
-2. **脚本永不自更新、无回传**；除发行版包管理器与官方 Release 外不访问其他地址
+2. **脚本永不自更新、无回传配置数据**；除发行版包管理器与官方 Release 外，仅在生成分享链接/Clash 配置时查询一次公网 IP（api.ipify.org，不发送任何配置，本进程内缓存）
 3. UFW 联动: 配置重建后自动同步防火墙 (放行新节点端口/回收已删端口, sbm 管理的规则记在 /etc/sbm/fw.list)
 4. 状态保存在 `/etc/sbm/nodes.json`、`relay.json`、`meta.json`；sing-box 配置由状态全量重建，
    每次重建先过 `sing-box check`，校验失败自动回滚状态、保留旧配置
+
+## v0.5.0 修复（2026-11-24，对照 singbox-lite 功能描述复审）
+- 中转列表判断 `[ "$rn"!= 0 ]` 缺空格已修复
+- 回滚补全：删除/改名/改端口节点、删除/改端口/清空中转、切换 DNS 失败时均回滚状态；配置通过校验但服务重启失败时自动恢复上一份配置并回滚
+- Clash/Mihomo 配置补全：新增 VLESS+gRPC、VLESS+TCP、Snell 条目；Hysteria2 带 Salamander 混淆时写入 obfs 字段；proxy-group 只引用实际生成的节点，不再产生坏配置
+- 新增端口冲突检查：新建/修改节点、中转、转发时校验端口合法性与占用（状态内查重 + 系统监听提醒）
+- 第三方导入收紧：带 plugin 的 ss:// 链接明确拒绝（不再静默剥离）；vless:// 校验 UUID 格式、Reality 公钥/SNI、WS 路径；地址不带端口时按协议默认端口解析
+- 卸载清理补全：回收 UFW 放行/转发规则、定时重启 crontab、nft 服务与规则表、sbm 命令本体
+- nft 转发引擎：域名目标在每次同步时解析为 IPv4 并明确提示；IPv6 目标明确跳过并告警（请改用 sing-box 引擎）；切回 sing-box 引擎不再强制关闭 ip_forward（避免误伤 Docker 等）
+- 防火墙：Snell 入站补放行 UDP；SS 加密方式菜单输错不再静默套用默认项
+- 主菜单 [13] 改为“检查新版本（仅检查不安装）”，与 [15] 安装/更新不再重复；[9] 日志改为实时跟随
+- 落地 Token 菜单标注 SS+ShadowTLS 不支持导出（原“全协议”说法不准确）
+
+## 与上游 singbox-lite 仍存在的差距（诚实标注）
+- Argo 隧道、Xray 双核心、批量创建：仍在 v2 计划，未实现
+- 修改节点目前只有改名/改端口；上游可改认证、SNI/证书、Reality 密钥、WS/gRPC 路径、Hysteria2 混淆与带宽
+- Hysteria2 无端口跳跃；节点分享地址使用生成时的当前公网 IP，IP 变更后需重新查看链接
+- nft 引擎域名目标在同步时解析，无上游的每分钟自动刷新
+
+## 开荒脚本（kaihuang/）
+本仓库同时收录 VPS 开荒流程脚本，详见 `kaihuang/README.md`：
+- `kaihuang/debian-post-dd.sh` — DD（默认 bin456789/reinstall 装 Debian 13 最新版）后的开荒脚本：验机→更新→时区/主机名→SSH 加固（默认端口 49173、默认公钥、直接关密码登录）+Fail2ban→UFW→Swap→基础工具→自动更新/日志瘦身
+- `kaihuang/inspect.sh` — 只读巡检脚本：打印系统/资源/监听端口/服务/Docker/定时任务/登录记录，不做任何修改
 
 ## 使用
 ```bash

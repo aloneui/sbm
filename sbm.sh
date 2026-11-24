@@ -3,7 +3,7 @@
 # 由 Muse 从零编写。不含任何第三方脚本代码。
 # 设计原则:
 #   1. 核心只从 sing-box 官方 GitHub Release 下载, 有校验文件时强制 SHA-256 校验
-#   2. 本脚本永不自更新, 不回传任何数据; 除包管理器和官方 Release 外不访问其他地址
+#   2. 本脚本永不自更新, 不回传配置数据; 除包管理器和官方 Release 外, 仅在生成分享链接时查询公网 IP (api.ipify.org, 不发送任何配置)
 #   3. 所有状态保存在 /etc/sbm/*.json, 配置由状态文件全量重建, 可审计可回滚
 # 用法: 以 root 运行  bash sbm.sh   (可用 SBM_ROOT=/tmp/xxx 做沙盒测试)
 set -uo pipefail
@@ -19,7 +19,7 @@ NODES="$ETC/nodes.json"
 RELAY="$ETC/relay.json"
 META="$ETC/meta.json"
 CERTDIR="$SB_ETC/certs"
-VER="0.4.3"
+VER="0.5.0"
 
 C_R=$'\033[0m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[36m'; C_RED=$'\033[31m'
 say()  { printf '%s\n' "$*"; }
@@ -56,7 +56,13 @@ rand_port() { echo $(( (RANDOM % 40000) + 20000 )); }
 rand_hex()  { openssl rand -hex "$1"; }
 rand_pw()   { openssl rand -base64 18 | tr -d '/+=' | head -c "${1:-16}"; }
 gen_uuid()  { if [ -x "$SB_BIN" ]; then "$SB_BIN" generate uuid; else cat /proc/sys/kernel/random/uuid; fi; }
-server_ip() { curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}'; }
+_SBM_IP_CACHE=""
+server_ip() { # 本进程内缓存, 避免一次操作多次查询公网 IP
+  if [ -z "$_SBM_IP_CACHE" ]; then
+    _SBM_IP_CACHE=$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
+  fi
+  printf '%s' "$_SBM_IP_CACHE"
+}
 
 # ---------- 核心管理 ----------
 core_version() { [ -x "$SB_BIN" ] && "$SB_BIN" version 2>/dev/null | head -1 | awk '{print $3}' || echo ""; }
@@ -123,8 +129,32 @@ core_uninstall() {
   need_root
   local a; a=$(ask "确认卸载? 将停止服务并删除核心与全部节点/中转配置 (y/N): " "n")
   [ "$a" = "y" ] || { say "已取消"; return; }
-  [ -z "$ROOT" ] && { systemctl stop sing-box 2>/dev/null; systemctl disable sing-box 2>/dev/null; rm -f "$UNIT"; systemctl daemon-reload; }
-  rm -f "$SB_BIN"; rm -rf "$ETC" "$SB_ETC"
+  if [ -z "$ROOT" ]; then
+    systemctl stop sing-box 2>/dev/null; systemctl disable sing-box 2>/dev/null; rm -f "$UNIT"
+    # 定时重启的 crontab 条目
+    ( crontab -l 2>/dev/null | grep -vF 'systemctl restart sing-box' ) | crontab - 2>/dev/null || true
+    # nft 转发引擎残留
+    nft delete table ip sbm_fwd 2>/dev/null || true
+    systemctl disable sbm-nft >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/sbm-nft.service /etc/sysctl.d/99-sbm-fwd.conf
+    # UFW: 回收 sbm 管理的放行与转发规则 (在删状态目录之前读追踪表)
+    if has ufw && [ -f "$ETC/fw.list" ]; then
+      while read -r r; do [ -n "$r" ] && ufw delete allow "$r" >/dev/null 2>&1 || true; done < "$ETC/fw.list"
+    fi
+    if has ufw && [ -f "$ETC/fwroute.list" ]; then
+      while read -r _ h p pr; do
+        [ -n "${h:-}" ] || continue
+        if [ "$pr" = "both" ]; then
+          ufw route delete allow to "$h" port "$p" proto tcp >/dev/null 2>&1 || true
+          ufw route delete allow to "$h" port "$p" proto udp >/dev/null 2>&1 || true
+        else
+          ufw route delete allow to "$h" port "$p" proto "$pr" >/dev/null 2>&1 || true
+        fi
+      done < "$ETC/fwroute.list"
+    fi
+    systemctl daemon-reload
+  fi
+  rm -f "$SB_BIN" "$SB_LINK"; rm -rf "$ETC" "$SB_ETC"
   ok "已卸载 (脚本文件本身保留, 可手动删除)"
 }
 
@@ -171,14 +201,19 @@ rebuild_config() {
       err "sing-box 配置校验未通过, 未应用. 详情: $ETC/.check.log"; sed 's/^/    /' "$ETC/.check.log" >&2; rm -f "$tmp"; return 1
     fi
   fi
+  [ -f "$CONF" ] && cp "$CONF" "$ETC/.config.prev.json"
   mv "$tmp" "$CONF"; chmod 600 "$CONF"
   ok "配置已重建并通过校验"
   if [ -z "$ROOT" ] && systemctl is-enabled sing-box >/dev/null 2>&1; then
-    if systemctl restart sing-box; then
-      sleep 1
-      if systemctl is-active --quiet sing-box; then ok "服务已重启并正常运行"
-      else err "服务重启后未能正常运行 (可能配置运行时错误), 用菜单 [9] 看日志"; fi
-    else err "服务重启失败, 用菜单 [9] 看日志"; fi
+    if ! systemctl restart sing-box || { sleep 1; ! systemctl is-active --quiet sing-box; }; then
+      err "服务重启后未能正常运行, 正在恢复上一份配置"
+      if [ -f "$ETC/.config.prev.json" ]; then
+        cp "$ETC/.config.prev.json" "$CONF"
+        systemctl restart sing-box >/dev/null 2>&1 || true
+      fi
+      return 1
+    fi
+    ok "服务已重启并正常运行"
   fi
   fw_sync
   nft_sync
@@ -191,7 +226,7 @@ fw_desired() {
   jq -r '
     def proto_of:
       if .type == "hysteria2" or .type == "tuic" then "udp"
-      elif .type == "shadowsocks" or .type == "socks" then "both"
+      elif .type == "shadowsocks" or .type == "socks" or .type == "snell" then "both"
       elif .type == "direct" then (if .network == "tcp" then "tcp" elif .network == "udp" then "udp" else "both" end)
       else "tcp" end;
     .inbounds[] | select(.listen != "127.0.0.1") | .listen_port as $p | proto_of as $pr
@@ -280,22 +315,34 @@ nft_sync() {
   [ -n "$ROOT" ] && return 0
   [ "$(jq -r '.fw_engine // "sing-box"' "$META")" = "nft" ] || return 0
   has nft || return 0
-  local f="$ETC/sbm.nft" pre post
-  pre=$(jq -r '.forwards[] | (if .network == "udp" then ["udp"] elif .network == "tcp" then ["tcp"] else ["tcp", "udp"] end)[] as $pr | "    \($pr) dport \(.listen_port) dnat to \(.target_host):\(.target_port)"' "$RELAY")
-  post=$(jq -r '.forwards[] | (if .network == "udp" then ["udp"] elif .network == "tcp" then ["tcp"] else ["tcp", "udp"] end)[] as $pr | "    ip daddr \(.target_host) \($pr) dport \(.target_port) masquerade"' "$RELAY")
+  local f="$ETC/sbm.nft" pre="" post="" row h ip
+  while read -r row; do
+    [ -n "$row" ] || continue
+    h=$(jq -r .target_host <<<"$row")
+    if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then ip="$h"
+    elif [[ "$h" == *":"* ]]; then warn "nft 引擎暂不支持 IPv6 转发目标, 已跳过: $h (可改用 sing-box 引擎)"; continue
+    else
+      ip=$(getent ahostsv4 "$h" 2>/dev/null | awk 'NR==1{print $1}')
+      [ -n "$ip" ] || { warn "转发目标域名解析失败, 已跳过: $h"; continue; }
+    fi
+    pre+=$(jq -r --arg ip "$ip" '(if .network == "udp" then ["udp"] elif .network == "tcp" then ["tcp"] else ["tcp", "udp"] end)[] as $pr | "    \($pr) dport \(.listen_port) dnat to \($ip):\(.target_port)"' <<<"$row")$'
+'
+    post+=$(jq -r --arg ip "$ip" '(if .network == "udp" then ["udp"] elif .network == "tcp" then ["tcp"] else ["tcp", "udp"] end)[] as $pr | "    ip daddr \($ip) \($pr) dport \(.target_port) masquerade"' <<<"$row")$'
+'
+  done < <(jq -c '.forwards[]' "$RELAY")
   {
     echo "table ip sbm_fwd {"
     echo "  chain prerouting { type nat hook prerouting priority -100; policy accept;"
-    [ -n "$pre" ] && printf '%s\n' "$pre"
+    [ -n "$pre" ] && printf '%s' "$pre"
     echo "  }"
     echo "  chain postrouting { type nat hook postrouting priority 100; policy accept;"
-    [ -n "$post" ] && printf '%s\n' "$post"
+    [ -n "$post" ] && printf '%s' "$post"
     echo "  }"
     echo "}"
   } > "$f"
   nft delete table ip sbm_fwd 2>/dev/null || true
   if [ -n "$pre" ]; then
-    nft -f "$f" && ok "nftables 转发规则已应用" || err "nftables 规则应用失败"
+    nft -f "$f" && ok "nftables 转发规则已应用 (域名目标在每次同步时解析, 解析变更后需重新同步)" || err "nftables 规则应用失败"
   fi
 }
 
@@ -342,10 +389,29 @@ engine_switch() {
     nft delete table ip sbm_fwd 2>/dev/null || true
     nft_boot_disable
     rm -f /etc/sysctl.d/99-sbm-fwd.conf
-    sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+    # 不强制把 ip_forward 改回 0: 其他服务 (如 Docker) 可能依赖它, 只删本脚本自己的 sysctl 文件
   fi
   jq --arg e "$target" '.fw_engine = $e' "$META" > "$META.tmp" && mv "$META.tmp" "$META"
   rebuild_config && ok "已切换到 $target 引擎"
+}
+
+# ---------- 端口冲突检查 ----------
+port_conflict() { # port_conflict <port> [exclude-tag] : 已被本脚本其他入站/转发占用返回 0
+  local p="$1" ex="${2:-}"
+  jq -e --argjson p "$p" --arg ex "$ex" '
+    ([.nodes[]? | (.inbound, (.inbound_extra // [])[]) | select(.tag != $ex) | .listen_port] | index($p)) != null' "$NODES" >/dev/null 2>&1 && return 0
+  jq -e --argjson p "$p" --arg ex "$ex" '
+    (([.routes[]?.inbound | select(.tag != $ex) | .listen_port] + [.forwards[]? | select(.tag != $ex) | .listen_port]) | index($p)) != null' "$RELAY" >/dev/null 2>&1 && return 0
+  return 1
+}
+check_port_free() { # check_port_free <port> [exclude-tag]
+  case "${1:-}" in *[!0-9]*|"") err "端口不合法: ${1:-}"; return 1 ;; esac
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ] || { err "端口超出范围: $1"; return 1; }
+  if port_conflict "$1" "${2:-}"; then err "端口 $1 已被其他节点/中转/转发占用"; return 1; fi
+  if [ -z "$ROOT" ] && has ss && ss -tuln 2>/dev/null | awk '{print $5}' | grep -q ":$1\$"; then
+    warn "端口 $1 似乎已被系统其他进程监听 (继续可能导致 sing-box 启动失败)"
+  fi
+  return 0
 }
 
 # ---------- 证书 ----------
@@ -493,7 +559,8 @@ EOF
     5) method="2022-blake3-aes-128-gcm"; pw=$(openssl rand -base64 16) ;;
     7) method="2022-blake3-chacha20-poly1305"; pw=$(openssl rand -base64 32) ;;
     8) build_ss_shadowtls "$tag" "$port"; return ;;
-    *) method="2022-blake3-aes-256-gcm"; pw=$(openssl rand -base64 32) ;;
+    6) method="2022-blake3-aes-256-gcm"; pw=$(openssl rand -base64 32) ;;
+    *) err "无效的加密方式选择: $m"; return 1 ;;
   esac
   jq -n --arg tag "$tag" --argjson port "$port" --arg method "$method" --arg pw "$pw" '
     {inbound: {type:"shadowsocks", tag:$tag, listen:"::", listen_port:$port,
@@ -631,10 +698,16 @@ write_clash_yaml() {
         "  - {name: \($n), type: vless, server: \($ip), port: \($p), uuid: \($s.uuid), network: ws, tls: true, servername: \($s.sni), ws-opts: {path: \($s.path), headers: {Host: \($s.sni)}}, skip-cert-verify: true}"
       elif $s.proto=="trojan-ws" then
         "  - {name: \($n), type: trojan, server: \($ip), port: \($p), password: \($s.password), network: ws, sni: \($s.sni), ws-opts: {path: \($s.path), headers: {Host: \($s.sni)}}, skip-cert-verify: true}"
+      elif $s.proto=="vless-grpc" then
+        "  - {name: \($n), type: vless, server: \($ip), port: \($p), uuid: \($s.uuid), network: grpc, tls: true, servername: \($s.sni), grpc-opts: {grpc-service-name: \($s.service)}, skip-cert-verify: true}"
+      elif $s.proto=="vless-tcp" then
+        "  - {name: \($n), type: vless, server: \($ip), port: \($p), uuid: \($s.uuid), network: tcp, tls: false}"
+      elif $s.proto=="snell" then
+        "  - {name: \($n), type: snell, server: \($ip), port: \($p), psk: \($s.psk), version: \($s.version), udp: true}"
       elif $s.proto=="anytls" then
         "  - {name: \($n), type: anytls, server: \($ip), port: \($p), password: \($s.password), sni: \($s.sni), skip-cert-verify: true}"
       elif $s.proto=="hysteria2" then
-        "  - {name: \($n), type: hysteria2, server: \($ip), port: \($p), password: \($s.password), sni: \($s.sni), skip-cert-verify: true}"
+        "  - {name: \($n), type: hysteria2, server: \($ip), port: \($p), password: \($s.password), sni: \($s.sni), skip-cert-verify: true\(if ($s.obfs // "") != "" then ", obfs: salamander, obfs-password: \($s.obfs)" else "" end)}"
       elif $s.proto=="tuic" then
         "  - {name: \($n), type: tuic, server: \($ip), port: \($p), uuid: \($s.uuid), password: \($s.password), sni: \($s.sni), alpn: [h3], congestion-controller: bbr, skip-cert-verify: true}"
       elif $s.proto=="ss-shadowtls" then
@@ -645,7 +718,7 @@ write_clash_yaml() {
         "  - {name: \($n), type: socks5, server: \($ip), port: \($p), username: \($s.username), password: \($s.password)}"
       else empty end' "$NODES"
     echo "proxy-groups:"
-    echo "  - {name: PROXY, type: select, proxies: [DIRECT$(jq -r '[.nodes[].name] | map(", " + .) | join("")' "$NODES")]}"
+    echo "  - {name: PROXY, type: select, proxies: [DIRECT$(jq -r '[.nodes[] | select(.share.proto | IN("vless-reality","vless-ws","trojan-ws","vless-grpc","vless-tcp","anytls","hysteria2","tuic","ss","ss-shadowtls","socks5","snell")) | .name] | map(", " + .) | join("")' "$NODES")]}"
     echo "rules:"
     echo "  - MATCH,PROXY"
   } > "$tmp" && mv "$tmp" "$f"
@@ -680,6 +753,7 @@ local c name port tag built ip
 c=$(ask "请输入选项 [0]: " "0"); [ "$c" = "0" ] && return
 name=$(ask "节点名称: " "node-$(rand_hex 2)")
 port=$(ask "监听端口 [随机]: " "$(rand_port)")
+check_port_free "$port" || return 1
 tag=$(uniq_tag n "$name")
 built=$(build_by_choice "$c" "$tag" "$port") || { err "创建失败"; return 1;}
 cp "$NODES" "$NODES.bak"
@@ -703,7 +777,7 @@ pr=$(jq -r .share.proto <<<"$row"); sh=$(jq -c .share <<<"$row")
 printf '\n%s (%s) 端口 %s\n %s\n' "$nm" "$(proto_name "$pr")" "$pt" "$(share_link "$ip" "$pt" "$nm" "$sh")"
 done
 local rn; rn=$(jq '.routes|length' "$RELAY")
-if [ "$rn"!= 0 ]; then
+if [ "$rn" != "0" ]; then
 say ""; say "中转入口:"
 jq -c '.routes[]' "$RELAY" | while read -r row; do
 local nm pt pr sh
@@ -719,8 +793,10 @@ init_state
 jq -r '.nodes | to_entries[] | " [\(.key+1)] \(.value.name) (\(.value.share.proto) 端口 \(.value.inbound.listen_port))"' "$NODES" >&2
 local idx n; idx=$(ask "输入要删除的序号 [0 取消]: " "0"); [ "$idx" = "0" ] && return
 n=$(jq '.nodes|length' "$NODES"); [ "$idx" -ge 1 ] && [ "$idx" -le "$n" ] || { err "序号无效"; return;}
+cp "$NODES" "$NODES.bak"
 jq --argjson i "$((idx-1))" 'del(.nodes[$i])' "$NODES" > "$NODES.tmp" && mv "$NODES.tmp" "$NODES"
-rebuild_config && write_clash_yaml && ok "已删除"
+if rebuild_config; then rm -f "$NODES.bak"; write_clash_yaml && ok "已删除"
+else mv "$NODES.bak" "$NODES"; err "删除失败, 已回滚"; fi
 }
 
 node_modify() {
@@ -730,14 +806,17 @@ local idx n what name port
 idx=$(ask "输入要修改的序号 [0 取消]: " "0"); [ "$idx" = "0" ] && return
 n=$(jq '.nodes|length' "$NODES"); [ "$idx" -ge 1 ] && [ "$idx" -le "$n" ] || { err "序号无效"; return;}
 what=$(ask "[1] 改名称 [2] 改端口 [0] 取消: " "0")
+cp "$NODES" "$NODES.bak"
 case "$what" in
 1) name=$(ask "新名称: " ""); [ -n "$name" ] || return
 jq --argjson i "$((idx-1))" --arg v "$name" '.nodes[$i].name = $v' "$NODES" > "$NODES.tmp" && mv "$NODES.tmp" "$NODES";;
 2) port=$(ask "新端口: " ""); [ -n "$port" ] || return
+check_port_free "$port" "$(jq -r --argjson i "$((idx-1))" '.nodes[$i].inbound.tag' "$NODES")" || { rm -f "$NODES.bak"; return; }
 jq --argjson i "$((idx-1))" --argjson v "$port" '.nodes[$i].inbound.listen_port = $v' "$NODES" > "$NODES.tmp" && mv "$NODES.tmp" "$NODES";;
 *) return;;
 esac
-rebuild_config && write_clash_yaml && ok "已修改"
+if rebuild_config; then rm -f "$NODES.bak"; write_clash_yaml && ok "已修改"
+else mv "$NODES.bak" "$NODES"; err "修改失败, 已回滚"; fi
 }
 
 # ---------- 落地 / 中转 ----------
@@ -802,6 +881,7 @@ name=$(ask "中转节点名称 [$defname]: " "$defname")
 menu_protocols
 c=$(ask "选择中转入口协议 [0 取消]: " "0"); [ "$c" = "0" ] && return
 port=$(ask "中转监听端口 [随机]: " "$(rand_port)")
+check_port_free "$port" || return 1
 tag=$(uniq_tag r "$name")
 built=$(build_by_choice "$c" "$tag" "$port") || { err "入口创建失败"; return 1;}
 outbound=$(jq --arg t "out-$tag" '.tag = $t' <<<"$outbound")
@@ -841,7 +921,12 @@ local link="$1" rest uuid hostport query uuidpart
 rest="${link#vless://}"; rest="${rest%%#*}"
 uuidpart="${rest%%@*}"; rest="${rest#*@}"
 hostport="${rest%%\?*}"; query=""; case "$rest" in *\?*) query="${rest#*\?}";; esac
-local host port; host="${hostport%:*}"; host="${host#[}"; host="${host%]}"; port="${hostport##*:}"
+local host port
+if [[ "$hostport" == "["* ]]; then
+  host="${hostport#\[}"; host="${host%%\]*}"
+  case "$hostport" in *"]:"*) port="${hostport##*:}" ;; *) port="" ;; esac
+elif [[ "$hostport" == *":"* ]]; then host="${hostport%:*}"; port="${hostport##*:}"
+else host="$hostport"; port=""; fi
 uuid=$(urldecode "$uuidpart")
 local security type sni pbk sid flow path hosthdr svc
 security=$(qparam "$query" security); type=$(qparam "$query" type); sni=$(urldecode "$(qparam "$query" sni)")
@@ -875,7 +960,11 @@ else
 local dec; dec=$(b64d "$rest"); cred="${dec%%@*}"; hostport="${dec#*@}"
 method="${cred%%:*}"; pw="${cred#*:}"
 fi
-host="${hostport%:*}"; host="${host#[}"; host="${host%]}"; port="${hostport##*:}"
+if [[ "$hostport" == "["* ]]; then
+  host="${hostport#\[}"; host="${host%%\]*}"
+  case "$hostport" in *"]:"*) port="${hostport##*:}" ;; *) port="" ;; esac
+elif [[ "$hostport" == *":"* ]]; then host="${hostport%:*}"; port="${hostport##*:}"
+else host="$hostport"; port=""; fi
 jq -n --arg host "$host" --argjson port "${port:-8388}" --arg method "$method" --arg pw "$pw" '
 {type:"shadowsocks", tag:"", server:$host, server_port:$port, method:$method, password:$pw}'
 }
@@ -888,7 +977,9 @@ local c link outbound
 c=$(ask "选择导入方式 [0 取消]: " "0")
 case "$c" in
 1) link=$(ask "粘贴 vless:// 链接: " ""); outbound=$(parse_vless_link "$link");;
-2) link=$(ask "粘贴 ss:// 链接: " ""); outbound=$(parse_ss_link "$link");;
+2) link=$(ask "粘贴 ss:// 链接: " "")
+   if printf '%s' "$link" | grep -q '[?&]plugin='; then err "带 plugin 的 SS 链接不受支持 (ShadowTLS/混淆插件请改用本机节点创建)"; return 1; fi
+   outbound=$(parse_ss_link "$link");;
 3) local h p u pw; h=$(ask "服务器地址: " ""); p=$(ask "端口: " "")
 u=$(ask "用户名 (可空): " ""); pw=$(ask "密码 (可空): " "")
 outbound=$(jq -n --arg h "$h" --argjson p "${p:-1080}" --arg u "$u" --arg pw "$pw" '
@@ -905,6 +996,11 @@ esac
 [ -n "$outbound" ] && jq -e '
 (.server | type == "string" and length > 0)
 and (.server_port | type == "number" and . > 0 and . < 65536)
+and (if .type == "vless" then
+       (.uuid | type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))
+       and (if .tls.reality then ((.tls.reality.public_key | type == "string" and length >= 40) and (.tls.server_name | length > 0)) else true end)
+       and (if .transport.type == "ws" then (.transport.path | type == "string" and length > 0) else true end)
+     else true end)
 and (if .type == "shadowsocks" then
        (.method | IN("aes-128-gcm","aes-256-gcm","chacha20-ietf-poly1305","xchacha20-ietf-poly1305",
                       "2022-blake3-aes-128-gcm","2022-blake3-aes-256-gcm","2022-blake3-chacha20-poly1305"))
@@ -925,8 +1021,10 @@ relay_delete() {
 init_state; relay_list
 local idx n; idx=$(ask "输入要删除的链路序号 [0 取消]: " "0"); [ "$idx" = "0" ] && return
 n=$(jq '.routes|length' "$RELAY"); [ "$idx" -ge 1 ] && [ "$idx" -le "$n" ] || { err "序号无效"; return;}
+cp "$RELAY" "$RELAY.bak"
 jq --argjson i "$((idx-1))" 'del(.routes[$i])' "$RELAY" > "$RELAY.tmp" && mv "$RELAY.tmp" "$RELAY"
-rebuild_config && ok "已删除"
+if rebuild_config; then rm -f "$RELAY.bak"; ok "已删除"
+else mv "$RELAY.bak" "$RELAY"; err "删除失败, 已回滚"; fi
 }
 
 relay_change_port() {
@@ -934,14 +1032,19 @@ init_state; relay_list
 local idx n port; idx=$(ask "输入链路序号 [0 取消]: " "0"); [ "$idx" = "0" ] && return
 n=$(jq '.routes|length' "$RELAY"); [ "$idx" -ge 1 ] && [ "$idx" -le "$n" ] || { err "序号无效"; return;}
 port=$(ask "新监听端口: " ""); [ -n "$port" ] || return
+check_port_free "$port" "$(jq -r --argjson i "$((idx-1))" '.routes[$i].inbound.tag' "$RELAY")" || return
+cp "$RELAY" "$RELAY.bak"
 jq --argjson i "$((idx-1))" --argjson p "$port" '.routes[$i].inbound.listen_port = $p' "$RELAY" > "$RELAY.tmp" && mv "$RELAY.tmp" "$RELAY"
-rebuild_config && ok "已修改"
+if rebuild_config; then rm -f "$RELAY.bak"; ok "已修改"
+else mv "$RELAY.bak" "$RELAY"; err "修改失败, 已回滚"; fi
 }
 
 relay_clear() {
 local a; a=$(ask "确认清空全部中转配置? (y/N): " "n"); [ "$a" = "y" ] || return
+cp "$RELAY" "$RELAY.bak"
 jq '.routes = []' "$RELAY" > "$RELAY.tmp" && mv "$RELAY.tmp" "$RELAY"
-rebuild_config && ok "已清空"
+if rebuild_config; then rm -f "$RELAY.bak"; ok "已清空"
+else mv "$RELAY.bak" "$RELAY"; err "清空失败, 已回滚"; fi
 }
 
 # ---------- 端口转发 (sing-box direct 入站, TCP/UDP) ----------
@@ -969,6 +1072,7 @@ EOF
          p=$(ask "目标端口: " ""); lp=$(ask "本机监听端口 [随机]: " "$(rand_port)")
          net=$(ask "协议 [1]TCP+UDP [2]TCP [3]UDP: " "1")
          case "$net" in 2) net="tcp" ;; 3) net="udp" ;; *) net="tcp_and_udp" ;; esac
+         check_port_free "$lp" || continue
          tag="fwd-$lp"
          cp "$RELAY" "$RELAY.bak"
          jq --arg tag "$tag" --argjson lp "$lp" --arg h "$h" --argjson p "$p" --arg net "$net" \
@@ -989,6 +1093,7 @@ EOF
            2) v=$(ask "新目标端口: " ""); [ -n "$v" ] || { rm -f "$RELAY.bak"; continue; }
               jq --argjson i "$((idx-1))" --argjson v "$v" '.forwards[$i].target_port = $v' "$RELAY" > "$RELAY.tmp" && mv "$RELAY.tmp" "$RELAY" ;;
            3) v=$(ask "新监听端口: " ""); [ -n "$v" ] || { rm -f "$RELAY.bak"; continue; }
+              check_port_free "$v" "$(jq -r --argjson i "$((idx-1))" '.forwards[$i].tag' "$RELAY")" || { rm -f "$RELAY.bak"; continue; }
               jq --argjson i "$((idx-1))" --argjson v "$v" '.forwards[$i].listen_port = $v | .forwards[$i].tag = "fwd-\($v)"' "$RELAY" > "$RELAY.tmp" && mv "$RELAY.tmp" "$RELAY" ;;
            4) v=$(ask "协议 [1]TCP+UDP [2]TCP [3]UDP: " "1")
               case "$v" in 2) v="tcp" ;; 3) v="udp" ;; *) v="tcp_and_udp" ;; esac
@@ -1019,7 +1124,7 @@ cat >&2 <<'EOF'
 
 
 
-[1] 落地机: 生成全协议 Token
+[1] 落地机: 生成落地 Token (SS+ShadowTLS 不支持导出)
 [2] 中转机: 通过 Token 导入规则
 [3] 中转机: 导入第三方节点
 
@@ -1050,7 +1155,7 @@ status)
 say "sing-box: $(svc_state) 版本: $(core_version)"
 say "节点数: $(jq '.nodes|length' "$NODES" 2>/dev/null || echo 0) 中转链路: $(jq '.routes|length' "$RELAY" 2>/dev/null || echo 0) 端口转发: $(jq '.forwards|length' "$RELAY" 2>/dev/null || echo 0)"
 [ -z "$ROOT" ] && ss -tulnp 2>/dev/null | grep -E 'sing-box' || true;;
-log) [ -n "$ROOT" ] && { say "(沙盒模式无日志)"; return;}; journalctl -u sing-box -n 100 --no-pager;;
+log) [ -n "$ROOT" ] && { say "(沙盒模式无日志)"; return;}; journalctl -u sing-box -n 100 -f;;
 esac
 }
 
@@ -1077,13 +1182,15 @@ dns_menu() {
 init_state
 say "当前 DNS: $(jq -r .dns "$META") (cf=Cloudflare, google=Google, ali=阿里)" >&2
 local c; c=$(ask "[1] Cloudflare [2] Google [3] 阿里 [0] 返回: " "0")
+cp "$META" "$META.bak"
 case "$c" in
 1) jq '.dns="cf"' "$META" > "$META.tmp" && mv "$META.tmp" "$META";;
 2) jq '.dns="google"' "$META" > "$META.tmp" && mv "$META.tmp" "$META";;
 3) jq '.dns="ali"' "$META" > "$META.tmp" && mv "$META.tmp" "$META";;
 *) return;;
 esac
-rebuild_config && ok "DNS 已更新"
+if rebuild_config; then rm -f "$META.bak"; ok "DNS 已更新"
+else mv "$META.bak" "$META"; err "DNS 更新失败, 已回滚"; fi
 }
 
 config_check() {
@@ -1093,6 +1200,17 @@ if [ -f "$CONF" ] && "$SB_BIN" check -c "$CONF"; then ok "配置文件校验通�
 }
 
 not_in_v1() { warn "该功能不在本版范围内 (v0.1): $1";}
+
+core_check_update() { # 仅查询官方最新版本, 不下载不安装
+  install_deps || return 1
+  local rel latest cur
+  rel=$(curl -fsSL --max-time 20 https://api.github.com/repos/SagerNet/sing-box/releases/latest) || { err "获取官方版本失败"; return 1; }
+  latest=$(printf '%s' "$rel" | jq -r '.tag_name' | sed 's/^v//')
+  cur=$(core_version)
+  say "当前版本: ${cur:-未安装}  官方最新: ${latest:-未知}"
+  if [ -n "$cur" ] && [ "$cur" = "$latest" ]; then ok "已是最新版"
+  elif [ -n "$cur" ]; then warn "有新版本可用, 用主菜单 [15] 安装/更新"; fi
+}
 
 # ---------- 主菜单 ----------
 main_menu() {
@@ -1116,7 +1234,7 @@ Xray 服务: 未包含在本版
 [8] 查看运行状态 [9] 查看实时日志
 [10] 定时重启设置 [11] 时间诊断/校时
 
-[12] 检查配置文件 [13] 更新 Sing-box 核心 (官方源+校验)
+[12] 检查配置文件 [13] 检查 Sing-box 新版本 (仅检查)
 [14] DNS 设置
 
 [15] 安装/更新 Sing-box 核心
@@ -1135,7 +1253,7 @@ case "$c" in
 6) menu_service restart;; 7) menu_service stop;;
 8) menu_service status;; 9) menu_service log;;
 10) sched_restart;; 11) time_check;;
-12) config_check;; 13) core_install;;
+12) config_check;; 13) core_check_update;;
 14) dns_menu;;
 15) core_install;; 16) not_in_v1 "Xray 核心";;
 17) core_uninstall;;
