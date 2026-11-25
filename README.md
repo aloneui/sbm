@@ -1,14 +1,21 @@
 # sbm — sing-box 节点/中转管理脚本
 
 由 Muse 从零编写（不含任何第三方脚本代码）。
-版本 v0.5.0，单文件 bash，依赖：jq、curl、openssl（脚本会自动用 apt 安装）。
+版本 v0.5.0，单文件 bash；依赖 jq、curl、openssl、flock（util-linux）与 ss（iproute2），缺项时脚本会尝试通过系统包管理器安装。
 
 ## 设计原则
-1. 核心只从 sing-box 官方 GitHub Release 下载；官方未提供校验文件时明确提示，并打印安装包 SHA-256 备查
+1. 核心只从 sing-box 官方 GitHub Release 下载；必须取得 Release API 提供的 SHA-256 摘要并匹配，否则中止安装
 2. **脚本永不自更新、无回传配置数据**；除发行版包管理器与官方 Release 外，仅在生成分享链接/Clash 配置时查询一次公网 IP（api.ipify.org，不发送任何配置，本进程内缓存）
 3. UFW 联动: 配置重建后自动同步防火墙 (放行新节点端口/回收已删端口, sbm 管理的规则记在 /etc/sbm/fw.list)
-4. 状态保存在 `/etc/sbm/nodes.json`、`relay.json`、`meta.json`；sing-box 配置由状态全量重建，
-   每次重建先过 `sing-box check`，校验失败自动回滚状态、保留旧配置
+4. 状态保存在权限收紧的 `/etc/sbm/` 文件中；修改由状态锁串行化，配置以唯一临时文件原子替换。
+   每次重建必须通过 `sing-box check`；实机路径还核验 systemd、监听端口与本机防火墙/转发规则。
+   这些检查不代表云厂商防火墙、运营商路径或公网客户端连通性已验证。
+
+## 本地安全加固补丁
+- 新导出使用 `SBM2` Token（AES-256-CBC/PBKDF2 加密并附 HMAC-SHA256 完整性标签）；旧 `SBM1` 仍可导入，但会提示其未认证。
+- VLESS、Shadowsocks 链接及 Token outbound 会验证地址、端口、凭据和传输参数；错误的交互输入会要求重输。
+- 敏感状态及 Clash 输出使用严格权限；卸载只删除所有权清单记录的 SBM 文件，并保留其他文件。
+- 沙盒测试只证明配置/逻辑路径，不会启动真实服务，也不验证公网可达性。
 
 ## v0.5.0 修复（2026-11-24，对照 singbox-lite 功能描述复审）
 - 中转列表判断 `[ "$rn"!= 0 ]` 缺空格已修复
