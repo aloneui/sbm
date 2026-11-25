@@ -22,8 +22,11 @@ META="$ETC/meta.json"
 OWNED="$ETC/.owned-files"
 CERTDIR="$SB_ETC/certs"
 VER="0.5.0"
-
-C_R=$'\033[0m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[36m'; C_RED=$'\033[31m'
+if [[ -t 1 && -t 2 && -z "${NO_COLOR:-}" ]]; then
+  C_R=$'\033[0m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[36m'; C_RED=$'\033[31m'
+else
+  C_R=''; C_G=''; C_Y=''; C_B=''; C_RED=''
+fi
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '%s[+]%s %s\n' "$C_G" "$C_R" "$*"; }
 warn() { printf '%s[!]%s %s\n' "$C_Y" "$C_R" "$*"; }
@@ -110,8 +113,10 @@ validate_prompt() {
   local p="$1" v="$2" n
   [[ ${#v} -le 65536 && "$v" != *[[:cntrl:]]* ]] || return 1
   case "$p" in
-    *"确认卸载?"*|*"确认清空"*|*"启用 Salamander"*|*"启用 TLS"*|*"尝试校时"*)
+    *"确认卸载?"*|*"确认清空"*|*"确认删除"*|*"启用 Salamander"*|*"启用 TLS"*|*"尝试校时"*)
       [[ "$v" == y || "$v" == Y || "$v" == n || "$v" == N ]] ;;
+    *"[1] 改名称"*) valid_choice "$v" "0 1 2" ;;
+    *"[1] 目标地址"*) valid_choice "$v" "0 1 2 3 4" ;;
     *"Reality 伪装域名"*|*"TLS 域名"*|*"ShadowTLS 伪装域名"*) valid_domain "$v" ;;
     *"WebSocket 路径"*) valid_path "$v" ;;
     *"gRPC 服务名"*) valid_service "$v" ;;
@@ -131,8 +136,6 @@ validate_prompt() {
     *"[1] Cloudflare"*) valid_choice "$v" "0 1 2 3" ;;
     *"[1] vless:// 链接"*) valid_choice "$v" "0 1 2 3 4" ;;
     *"选择导入方式"*) valid_choice "$v" "0 1 2 3 4" ;;
-    *"[1] 改名称"*) valid_choice "$v" "0 1 2" ;;
-    *"[1] 目标地址"*) valid_choice "$v" "0 1 2 3 4" ;;
     *"输入要删除的序号"*|*"输入要删除的链路序号"*|*"输入要修改的序号"*|*"输入要修改的转发序号"*|*"选择要导出的落地节点"*|*"输入链路序号"*|*"删除序号"*)
       [[ "$v" == 0 ]] && return 0
       [[ "$v" =~ ^[0-9]{1,6}$ ]] || return 1
@@ -1235,7 +1238,7 @@ cat >&2 <<'EOF'
 [8] Shadowsocks
 [9] VLESS (TCP)
 [10] SOCKS5
-    [11] Snell (v5/v6, Surge 系)
+[11] Snell (v5/v6, Surge 系)
 [0] 返回
 EOF
 }
@@ -1257,30 +1260,33 @@ if ! jq --arg name "$name" --argjson b "$built" '.nodes += [{name:$name} + $b]' 
 fi
 if ! rebuild_config; then restore_state "$NODES.bak" "$NODES"; err "已回滚节点状态"; return 1; fi
 rm -f "$NODES.bak"
-write_clash_yaml || warn "节点本机服务已验证，但 Clash 文件未生成；请检查上方错误"
+write_clash_yaml || warn "节点配置已保存，但 Clash 文件未生成；请检查上方错误"
 ip=$(server_ip)
 if [ -n "$ROOT" ]; then
   ok "节点配置已保存并通过 sing-box 检查: $name ($(proto_name "$(jq -r .share.proto <<<"$built")"))"
-  warn "沙盒模式未启动服务、未验证系统监听，也未验证公网可达性；这不代表 VPS 节点已部署成功"
+  warn "沙盒模式未启动服务或验证系统监听；这不代表 VPS 节点已部署成功"
 else
   ok "节点本机部署已验证: $name ($(proto_name "$(jq -r .share.proto <<<"$built")"))；sing-box 检查通过、systemd 为 active、配置端口均已监听"
 fi
+warn "以上仅为本机配置/服务验证，未测试外部客户端可达性；云防火墙、运营商路径或 IP 封锁需从外部另行确认"
 if [ -n "$ip" ]; then say " 链接: $(share_link "$ip" "$port" "$name" "$(jq -c .share <<<"$built")")"
 else warn "未能获取公网 IPv4，未生成分享链接；本机监听成功不等于公网可达，需另行检查云防火墙/运营商网络"; fi
 }
 
 node_list_links() {
-init_state; local ip; ip=$(server_ip)
-local n; n=$(jq '.nodes|length' "$NODES")
-[ "$n" = 0 ] && { say "暂无节点"; return;}
+init_state
+local ip n rn
+n=$(jq '.nodes|length' "$NODES")
+rn=$(jq '.routes|length' "$RELAY")
+if [ "$n" = 0 ] && [ "$rn" = 0 ]; then say "暂无节点或中转链路"; return; fi
+ip=$(server_ip)
 if [ -z "$ip" ]; then warn "无法确认公网 IPv4，暂不输出可能错误的分享链接；请检查公网地址服务后重试"; return 1; fi
-jq -c '.nodes[]' "$NODES" | while read -r row; do
+if [ "$n" = 0 ]; then say "本机暂无节点"; else jq -c '.nodes[]' "$NODES" | while read -r row; do
 local nm pt pr sh
 nm=$(jq -r .name <<<"$row"); pt=$(jq -r .inbound.listen_port <<<"$row")
 pr=$(jq -r .share.proto <<<"$row"); sh=$(jq -c .share <<<"$row")
 printf '\n%s (%s) 端口 %s\n %s\n' "$nm" "$(proto_name "$pr")" "$pt" "$(share_link "$ip" "$pt" "$nm" "$sh")"
-done
-local rn; rn=$(jq '.routes|length' "$RELAY")
+done; fi
 if [ "$rn" != "0" ]; then
 say ""; say "中转入口:"
 jq -c '.routes[]' "$RELAY" | while read -r row; do
@@ -1294,19 +1300,31 @@ fi
 
 node_delete() {
 init_state
+local n; n=$(jq '.nodes|length' "$NODES")
+[ "$n" -gt 0 ] || { say "暂无节点可删除"; return; }
 jq -r '.nodes | to_entries[] | " [\(.key+1)] \(.value.name) (\(.value.share.proto) 端口 \(.value.inbound.listen_port))"' "$NODES" >&2
-local idx n; idx=$(ask "输入要删除的序号 [0 取消]: " "0"); [ "$idx" = "0" ] && return
+local idx row name port answer
+idx=$(ask "输入要删除的序号 [0 取消]: " "0"); [ "$idx" = "0" ] && return
 n=$(jq '.nodes|length' "$NODES"); [ "$idx" -ge 1 ] && [ "$idx" -le "$n" ] || { err "序号无效"; return;}
+row=$(jq -c --argjson i "$((idx-1))" '.nodes[$i]' "$NODES")
+name=$(jq -r '.name' <<<"$row"); port=$(jq -r '.inbound.listen_port' <<<"$row")
+answer=$(ask "确认删除节点「$name」（监听端口 $port）? (y/N): " "n")
+[ "$answer" = "y" ] || { say "已取消删除"; return; }
 backup_state "$NODES" || return 1
 if ! jq --argjson i "$((idx-1))" 'del(.nodes[$i])' "$NODES" | atomic_write "$NODES"; then restore_state "$NODES.bak" "$NODES"; err "状态写入失败，已回滚"; return 1; fi
-if rebuild_config; then rm -f "$NODES.bak"; write_clash_yaml && ok "已删除"
+if rebuild_config; then
+  rm -f "$NODES.bak"
+  if write_clash_yaml; then ok "节点已删除并更新 Clash 文件"
+  else warn "节点已删除且配置已应用，但 Clash 文件未更新；请检查上方错误"; fi
 else restore_state "$NODES.bak" "$NODES"; err "删除失败, 已回滚"; fi
 }
 
 node_modify() {
 init_state
+local n; n=$(jq '.nodes|length' "$NODES")
+[ "$n" -gt 0 ] || { say "暂无节点可修改"; return; }
 jq -r '.nodes | to_entries[] | " [\(.key+1)] \(.value.name) 端口 \(.value.inbound.listen_port)"' "$NODES" >&2
-local idx n what name port
+local idx what name port
 idx=$(ask "输入要修改的序号 [0 取消]: " "0"); [ "$idx" = "0" ] && return
 n=$(jq '.nodes|length' "$NODES"); [ "$idx" -ge 1 ] && [ "$idx" -le "$n" ] || { err "序号无效"; return;}
 what=$(ask "[1] 改名称 [2] 改端口 [0] 取消: " "0")
@@ -1319,7 +1337,10 @@ check_port_free "$port" "$(jq -r --argjson i "$((idx-1))" '.nodes[$i].inbound.ta
 jq --argjson i "$((idx-1))" --argjson v "$port" '.nodes[$i].inbound.listen_port = $v' "$NODES" | atomic_write "$NODES" || { restore_state "$NODES.bak" "$NODES"; err "状态写入失败，已回滚"; return 1; };;
 *) rm -f "$NODES.bak"; return;;
 esac
-if rebuild_config; then rm -f "$NODES.bak"; write_clash_yaml && ok "已修改"
+if rebuild_config; then
+  rm -f "$NODES.bak"
+  if write_clash_yaml; then ok "节点已修改并更新 Clash 文件"
+  else warn "节点已修改且配置已应用，但 Clash 文件未更新；请检查上方错误"; fi
 else restore_state "$NODES.bak" "$NODES"; err "修改失败, 已回滚"; fi
 }
 
@@ -1475,10 +1496,11 @@ rm -f "$RELAY.bak"
 ip=$(server_ip)
 if [ -n "$ROOT" ]; then
   ok "中转配置已保存并通过 sing-box 检查: $name -> $(jq -r .server <<<"$outbound"):$(jq -r .server_port <<<"$outbound")"
-  warn "沙盒模式未启动服务、未验证监听或公网可达性"
+  warn "沙盒模式未启动服务或核验系统监听"
 else
   ok "中转本机部署已验证: $name；sing-box 检查通过、systemd 为 active、配置端口均已监听"
 fi
+warn "以上不代表入口端口从公网可达；云防火墙、运营商路径或 IP 封锁需从外部另行确认"
 if [ -n "$ip" ]; then say " 链接: $(share_link "$ip" "$port" "$name" "$(jq -c .share <<<"$built")")"
 else warn "未能获取公网 IPv4，未生成入口分享链接；公网可达性尚未验证"; fi
 }
@@ -1667,8 +1689,14 @@ jq -r '.routes | to_entries[] |
 
 relay_delete() {
 init_state; relay_list
-local idx n; idx=$(ask "输入要删除的链路序号 [0 取消]: " "0"); [ "$idx" = "0" ] && return
+local idx n row name port answer
+n=$(jq '.routes|length' "$RELAY"); [ "$n" -gt 0 ] || return
+idx=$(ask "输入要删除的链路序号 [0 取消]: " "0"); [ "$idx" = "0" ] && return
 n=$(jq '.routes|length' "$RELAY"); [ "$idx" -ge 1 ] && [ "$idx" -le "$n" ] || { err "序号无效"; return;}
+row=$(jq -c --argjson i "$((idx-1))" '.routes[$i]' "$RELAY")
+name=$(jq -r '.name' <<<"$row"); port=$(jq -r '.inbound.listen_port' <<<"$row")
+answer=$(ask "确认删除中转链路「$name」（入口端口 $port）? (y/N): " "n")
+[ "$answer" = "y" ] || { say "已取消删除"; return; }
 backup_state "$RELAY" || { err "无法创建状态备份"; return 1; }
 if ! jq --argjson i "$((idx-1))" 'del(.routes[$i])' "$RELAY" | atomic_write "$RELAY"; then restore_state "$RELAY.bak" "$RELAY"; err "状态写入失败，已回滚"; return 1; fi
 if rebuild_config; then rm -f "$RELAY.bak"; ok "已删除"
@@ -1677,7 +1705,9 @@ else restore_state "$RELAY.bak" "$RELAY"; err "删除失败, 已回滚"; fi
 
 relay_change_port() {
 init_state; relay_list
-local idx n port; idx=$(ask "输入链路序号 [0 取消]: " "0"); [ "$idx" = "0" ] && return
+local idx n port
+n=$(jq '.routes|length' "$RELAY"); [ "$n" -gt 0 ] || return
+idx=$(ask "输入链路序号 [0 取消]: " "0"); [ "$idx" = "0" ] && return
 n=$(jq '.routes|length' "$RELAY"); [ "$idx" -ge 1 ] && [ "$idx" -le "$n" ] || { err "序号无效"; return;}
 port=$(ask "新监听端口: " ""); [ -n "$port" ] || return
 check_port_free "$port" "$(jq -r --argjson i "$((idx-1))" '.routes[$i].inbound.tag' "$RELAY")" || return
@@ -1688,6 +1718,9 @@ else restore_state "$RELAY.bak" "$RELAY"; err "修改失败, 已回滚"; fi
 }
 
 relay_clear() {
+init_state
+local rn; rn=$(jq '.routes|length' "$RELAY")
+[ "$rn" -gt 0 ] || { say "暂无中转链路可清空"; return; }
 local a; a=$(ask "确认清空全部中转配置? (y/N): " "n"); [ "$a" = "y" ] || return
 backup_state "$RELAY" || { err "无法创建状态备份"; return 1; }
 if ! jq '.routes = []' "$RELAY" | atomic_write "$RELAY"; then restore_state "$RELAY.bak" "$RELAY"; err "状态写入失败，已回滚"; return 1; fi
@@ -1728,8 +1761,9 @@ EOF
            "$RELAY" | atomic_write "$RELAY" || { restore_state "$RELAY.bak" "$RELAY"; err "状态写入失败，已回滚"; continue; }
          if rebuild_config; then rm -f "$RELAY.bak"; ok "转发已添加: :$lp -> $h:$p ($net)"
          else restore_state "$RELAY.bak" "$RELAY"; err "已回滚转发状态"; fi ;;
-      2) jq -r '.forwards | to_entries[] | "  [\(.key+1)] :\(.value.listen_port) -> \(.value.target_host):\(.value.target_port) (\(.value.network))"' "$RELAY" ;;
+      2) [ "$cnt" -gt 0 ] && jq -r '.forwards | to_entries[] | "  [\(.key+1)] :\(.value.listen_port) -> \(.value.target_host):\(.value.target_port) (\(.value.network))"' "$RELAY" || say "暂无转发规则" ;;
       3) local idx n what v
+         [ "$cnt" -gt 0 ] || { say "暂无转发规则可修改"; continue; }
          jq -r '.forwards | to_entries[] | "  [\(.key+1)] :\(.value.listen_port) -> \(.value.target_host):\(.value.target_port) (\(.value.network))"' "$RELAY" >&2
          idx=$(ask "输入要修改的转发序号 [0 取消]: " "0"); [ "$idx" = "0" ] && continue
          n=$(jq '.forwards|length' "$RELAY"); [ "$idx" -ge 1 ] && [ "$idx" -le "$n" ] || { err "序号无效"; continue; }
@@ -1750,17 +1784,24 @@ EOF
          esac
          if rebuild_config; then rm -f "$RELAY.bak"; ok "已修改"; else restore_state "$RELAY.bak" "$RELAY"; err "已回滚"; fi ;;
       4) local idx n
+         [ "$cnt" -gt 0 ] || { say "暂无转发规则可删除"; continue; }
          jq -r '.forwards | to_entries[] | "  [\(.key+1)] :\(.value.listen_port) -> \(.value.target_host):\(.value.target_port)"' "$RELAY" >&2
          idx=$(ask "删除序号 [0 取消]: " "0"); [ "$idx" = "0" ] && continue
          n=$(jq '.forwards|length' "$RELAY"); [ "$idx" -ge 1 ] && [ "$idx" -le "$n" ] || { err "序号无效"; continue; }
+         local row name port answer
+         row=$(jq -c --argjson i "$((idx-1))" '.forwards[$i]' "$RELAY")
+         name=$(jq -r '.target_host' <<<"$row"); port=$(jq -r '.listen_port' <<<"$row")
+         answer=$(ask "确认删除转发规则「:$port -> $name」? (y/N): " "n")
+         [ "$answer" = "y" ] || { say "已取消删除"; continue; }
          backup_state "$RELAY" || continue
          jq --argjson i "$((idx-1))" 'del(.forwards[$i])' "$RELAY" | atomic_write "$RELAY" || { restore_state "$RELAY.bak" "$RELAY"; err "状态写入失败，已回滚"; continue; }
-         if rebuild_config; then rm -f "$RELAY.bak"; ok "已删除"; else restore_state "$RELAY.bak" "$RELAY"; err "已回滚"; fi ;;
+         if rebuild_config; then rm -f "$RELAY.bak"; ok "转发规则已删除"; else restore_state "$RELAY.bak" "$RELAY"; err "已回滚"; fi ;;
       5) engine_switch ;;
-      6) local a; a=$(ask "确认清空全部转发规则? (y/N): " "n"); [ "$a" = "y" ] || continue
+      6) [ "$cnt" -gt 0 ] || { say "当前没有转发规则"; continue; }
+         local a; a=$(ask "确认清空全部转发规则? (y/N): " "n"); [ "$a" = "y" ] || continue
          backup_state "$RELAY" || continue
          jq '.forwards = []' "$RELAY" | atomic_write "$RELAY" || { restore_state "$RELAY.bak" "$RELAY"; err "状态写入失败，已回滚"; continue; }
-         if rebuild_config; then rm -f "$RELAY.bak"; ok "已清空"; else restore_state "$RELAY.bak" "$RELAY"; err "已回滚"; fi ;;
+         if rebuild_config; then rm -f "$RELAY.bak"; ok "转发规则已清空"; else restore_state "$RELAY.bak" "$RELAY"; err "已回滚"; fi ;;
       0) return ;;
     esac
   done
@@ -1797,8 +1838,16 @@ done
 # ---------- 服务控制 ----------
 menu_service() { # <action>
 case "$1" in
-restart) svc restart; ok "已重启";;
-stop) svc stop; ok "已停止";;
+restart)
+  if [ -n "$ROOT" ]; then warn "沙盒模式：未执行 systemctl restart，服务状态未验证"; return 0; fi
+  if svc restart && [ "$(svc_state)" = "active" ]; then ok "sing-box 已重启并确认处于 active 状态"
+  else err "sing-box 重启或运行状态验证失败；请查看 systemctl status sing-box"; return 1; fi ;;
+stop)
+  if [ -n "$ROOT" ]; then warn "沙盒模式：未执行 systemctl stop，服务状态未改变"; return 0; fi
+  if svc stop; then
+    local state; state=$(svc_state)
+    case "$state" in inactive|dead) ok "sing-box 已停止并确认未运行";; *) err "停止命令已返回，但服务状态为 $state；请查看 systemctl status sing-box"; return 1;; esac
+  else err "sing-box 停止失败；请查看 systemctl status sing-box"; return 1; fi ;;
 status)
 say "sing-box: $(svc_state) 版本: $(core_version)"
 say "节点数: $(jq '.nodes|length' "$NODES" 2>/dev/null || echo 0) 中转链路: $(jq '.routes|length' "$RELAY" 2>/dev/null || echo 0) 端口转发: $(jq '.forwards|length' "$RELAY" 2>/dev/null || echo 0)"
@@ -1836,6 +1885,7 @@ dns_menu() {
 init_state
 say "当前 DNS: $(jq -r .dns "$META") (cf=Cloudflare, google=Google, ali=阿里)" >&2
 local c; c=$(ask "[1] Cloudflare [2] Google [3] 阿里 [0] 返回: " "0")
+[ "$c" = "0" ] && return
 backup_state "$META" || return 1
 case "$c" in
 1) jq '.dns="cf"' "$META" | atomic_write "$META" || { restore_state "$META.bak" "$META"; err "DNS 状态写入失败，已回滚"; return 1; };;
@@ -1850,10 +1900,13 @@ else restore_state "$META.bak" "$META"; err "DNS 更新失败, 已回滚"; fi
 config_check() {
 init_state
 [ -x "$SB_BIN" ] || { warn "核心未安装"; return;}
-if [ -f "$CONF" ] && "$SB_BIN" check -c "$CONF"; then ok "配置文件校验通过"; else err "校验失败或配置不存在"; fi
+if [ -f "$CONF" ] && "$SB_BIN" check -c "$CONF"; then
+  ok "本机 sing-box 配置格式校验通过"
+  warn "此项不验证公网客户端可达性、云防火墙或运营商路径"
+else err "配置校验失败或配置不存在"; fi
 }
 
-not_in_v1() { warn "该功能不在本版范围内 (v0.1): $1";}
+not_in_v1() { warn "该功能暂未实现（规划中）: $1";}
 
 core_check_update() { # 仅查询官方最新版本, 不下载不安装
   install_deps || return 1
@@ -1871,33 +1924,35 @@ main_menu() {
 acquire_state_lock || return 1
 init_state || return 1
 while true; do
-local st="未运行" xv="未安装"
-[ "$(svc_state)" = "active" ] && st="${C_G}运行中${C_R}"
+local st="未运行" svc
+svc=$(svc_state)
+case "$svc" in active) st="${C_G}运行中${C_R}";; 沙盒) st="沙盒模式（服务控制未执行）";; esac
 cat >&2 <<EOF
 
 sbm v$VER — sing-box 管理 (Muse 编写, 无自更新/无回传)
 系统版本: $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}")
-sing-box: $(core_version || echo 未安装) 服务: $st
-Xray 服务: 未包含在本版
+sing-box: $(core_version || echo 未安装)  服务: $st
 
 
-[1] 添加节点 [2] Argo 隧道节点 (v2)
-[3] 查看节点链接 [4] 删除节点
-[5] 修改节点
+【节点】
+[1] 添加节点   [3] 查看节点链接   [4] 删除节点   [5] 修改节点
 
+【服务】
 [6] 重启服务 [7] 停止服务
 [8] 查看运行状态 [9] 查看实时日志
 [10] 定时重启设置 [11] 时间诊断/校时
 
+【配置与系统】
 [12] 检查配置文件 [13] 检查 Sing-box 新版本 (仅检查)
 [14] DNS 设置
-
 [15] 安装/更新 Sing-box 核心
-[16] 安装/更新 Xray 核心 (v2)
 [17] 卸载
 
+【中转与扩展】
 [18] 落地/中转/第三方节点导入/端口转发
-[19] Xray 节点管理 (v2)
+[2] Argo 隧道节点（暂未实现）
+[16] 安装/更新 Xray 核心（暂未实现）
+[19] Xray 节点管理（暂未实现）
 [0] 退出
 EOF
 local c; c=$(ask "主菜单选项 [0]: " "0")
