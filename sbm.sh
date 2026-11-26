@@ -556,7 +556,7 @@ verify_listeners() {
   while IFS=/ read -r port proto; do
     [ -n "$port" ] || continue
     case "$proto" in tcp) ss_args=(-H -lnt);; udp) ss_args=(-H -lnu);; *) err "内部端口协议无效: $proto"; return 1;; esac
-    if ! ss "${ss_args[@]}" 2>/dev/null | awk -v suffix=":$port" 'substr($5, length($5)-length(suffix)+1) == suffix {found=1} END {exit !found}'; then
+    if ! ss "${ss_args[@]}" 2>/dev/null | awk -v suffix=":$port" '(substr($4, length($4)-length(suffix)+1) == suffix || substr($5, length($5)-length(suffix)+1) == suffix) {found=1} END {exit !found}'; then
       err "$proto 端口 $port 未出现在系统监听列表中"; return 1
     fi
   done < <(jq -r '
@@ -603,7 +603,7 @@ fw_sync() {
     [ -n "$r" ] && ufw delete allow "$r" >/dev/null 2>&1 && say "  防火墙回收: $r"
   done < <(comm -23 <(printf '%s\n' "$have") <(printf '%s\n' "$want"))
   mark_owned_if_new 'etc/sbm/fw.list' "$list" || return 1
-  { printf '%s\n' "$want"; printf '%s\n' "$have"; } | grep -v '^$' | sort -u | while read -r r; do
+  { printf '%s\n' "$want"; printf '%s\n' "$have"; } | { grep -v '^$' || true; } | sort -u | while read -r r; do
     [ -n "$r" ] && fw_exists "$r" && echo "$r"
   done | atomic_write "$list" || return 1
   [ "$failed" = 0 ] || return 1
@@ -658,7 +658,7 @@ fw_route_sync() {
     say "  转发回收: $h:$p/$pr"
   done < <(comm -23 <(printf '%s\n' "$have") <(printf '%s\n' "$want"))
   mark_owned_if_new 'etc/sbm/fwroute.list' "$list" || return 1
-  { printf '%s\n' "$want"; printf '%s\n' "$have"; } | grep -v '^$' | sort -u | while read -r r; do
+  { printf '%s\n' "$want"; printf '%s\n' "$have"; } | { grep -v '^$' || true; } | sort -u | while read -r r; do
     [ -n "$r" ] || continue
     set -- $r; h="$2"; p="$3"; pr="$4"
     if [ "$pr" = "both" ]; then
